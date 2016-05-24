@@ -21,9 +21,7 @@
 
 #include "rgw_client_io.h"
 
-/* This header consists several Keystone-related primitives
- * we want to reuse here. */
-#include "rgw_swift.h"
+#include "rgw_keystone.h"
 
 #include <typeinfo> // for 'typeid'
 
@@ -92,8 +90,13 @@ int RGWGetObj_ObjStore_S3Website::send_response_data(bufferlist& bl, off_t bl_of
     bufferlist &bl = iter->second;
     s->redirect = string(bl.c_str(), bl.length());
     s->err.http_ret = 301;
-    ldout(s->cct, 20) << __CEPH_ASSERT_FUNCTION << " redirectng per x-amz-website-redirect-location=" << s->redirect << dendl;
+    ldout(s->cct, 20) << __CEPH_ASSERT_FUNCTION << " redirecting per x-amz-website-redirect-location=" << s->redirect << dendl;
     op_ret = -ERR_WEBSITE_REDIRECT;
+    set_req_state_err(s, op_ret);
+    dump_errno(s);
+    dump_content_length(s, 0);
+    dump_redirect(s, s->redirect);
+    end_header(s, this);
     return op_ret;
   } else {
     return RGWGetObj_ObjStore_S3::send_response_data(bl, bl_ofs, bl_len);
@@ -246,9 +249,14 @@ int RGWGetObj_ObjStore_S3::send_response_data(bufferlist& bl, off_t bl_ofs,
   }
 
 done:
-  set_req_state_err(s, (partial_content && !op_ret) ? STATUS_PARTIAL_CONTENT
-		    : op_ret);
-  dump_errno(s);
+  if (custom_http_ret) {
+    set_req_state_err(s, 0);
+    dump_errno(s, custom_http_ret);
+  } else {
+    set_req_state_err(s, (partial_content && !op_ret) ? STATUS_PARTIAL_CONTENT
+          	  : op_ret);
+    dump_errno(s);
+  }
 
   for (riter = response_attrs.begin(); riter != response_attrs.end();
        ++riter) {
@@ -761,6 +769,13 @@ int RGWSetBucketWebsite_ObjStore_S3::get_params()
     return r;
   }
 
+  if (s->aws4_auth_needs_complete) {
+      int ret_auth = do_aws4_auth_completion();
+      if (ret_auth < 0) {
+        return ret_auth;
+      }
+  }
+
   bufferlist bl;
   bl.append(data, len);
 
@@ -918,12 +933,12 @@ int RGWCreateBucket_ObjStore_S3::get_params()
   policy = s3policy;
 
   int len = 0;
-  char *data;
+  char *data = nullptr;
 #define CREATE_BUCKET_MAX_REQ_LEN (512 * 1024) /* this is way more than enough */
   op_ret = rgw_rest_read_all_input(s, &data, &len, CREATE_BUCKET_MAX_REQ_LEN);
   if ((op_ret < 0) && (op_ret != -ERR_LENGTH_REQUIRED))
     return op_ret;
-  
+
   auto data_deleter = std::unique_ptr<char, decltype(free)*>{data, free};
 
   if (s->aws4_auth_needs_complete) {
@@ -1688,6 +1703,10 @@ int RGWPostObj_ObjStore_S3::get_policy()
     *(s->user) = user_info;
     s->owner.set_id(user_info.user_id);
     s->owner.set_name(user_info.display_name);
+
+    /* FIXME: remove this after switching S3 to the new authentication
+     * infrastructure. */
+    s->auth_identity = rgw_auth_transform_old_authinfo(s);
   } else {
     ldout(s->cct, 0) << "No attached policy found!" << dendl;
   }
@@ -2931,7 +2950,7 @@ int RGW_Auth_S3_Keystone_ValidateToken::validate_s3token(
 
   /* get authentication token for Keystone. */
   string admin_token_id;
-  int r = RGWSwift::get_keystone_admin_token(cct, admin_token_id);
+  int r = KeystoneService::get_keystone_admin_token(cct, admin_token_id);
   if (r < 0) {
     ldout(cct, 2) << "s3 keystone: cannot get token for keystone access" << dendl;
     return r;
@@ -2986,10 +3005,11 @@ int RGW_Auth_S3_Keystone_ValidateToken::validate_s3token(
 
   /* check if we have a valid role */
   bool found = false;
-  list<string>::iterator iter;
-  for (iter = roles_list.begin(); iter != roles_list.end(); ++iter) {
-    if ((found=response.has_role(*iter))==true)
+  for (const auto& role : accepted_roles) {
+    if (response.has_role(role) == true) {
+      found = true;
       break;
+    }
   }
 
   if (!found) {
@@ -3564,7 +3584,7 @@ int RGW_Auth_S3::authorize_v4(RGWRados *store, struct req_state *s)
 
     /* aws4 auth not completed... delay aws4 auth */
 
-    dout(10) << "body content detected... delaying v4 auth" << dendl;
+    dout(10) << "delaying v4 auth" << dendl;
 
     switch (s->op_type)
     {
@@ -3576,6 +3596,7 @@ int RGW_Auth_S3::authorize_v4(RGWRados *store, struct req_state *s)
       case RGW_OP_SET_BUCKET_VERSIONING:
       case RGW_OP_DELETE_MULTI_OBJ:
       case RGW_OP_ADMIN_SET_METADATA:
+      case RGW_OP_SET_BUCKET_WEBSITE:
         break;
       default:
         dout(10) << "ERROR: AWS4 completion for this operation NOT IMPLEMENTED" << dendl;
@@ -3617,7 +3638,7 @@ int RGW_Auth_S3::authorize_v4(RGWRados *store, struct req_state *s)
       int ret = rgw_get_user_info_by_uid(store, effective_uid, effective_user);
       if (ret < 0) {
         ldout(s->cct, 0) << "User lookup failed!" << dendl;
-        return -ENOENT;
+        return -EACCES;
       }
       *(s->user) = effective_user;
     }
@@ -3825,7 +3846,7 @@ int RGW_Auth_S3::authorize_v2(RGWRados *store, struct req_state *s)
         ret = rgw_get_user_info_by_uid(store, euid, effective_user);
         if (ret < 0) {
           ldout(s->cct, 0) << "User lookup failed!" << dendl;
-          return -ENOENT;
+          return -EACCES;
         }
         *(s->user) = effective_user;
       }
@@ -3951,52 +3972,87 @@ RGWOp* RGWHandler_REST_S3Website::op_head()
   return get_obj_op(false);
 }
 
-int RGWHandler_REST_S3Website::get_errordoc(const string& errordoc_key,
-					    std::string* error_content) {
-  ldout(s->cct, 20) << "TODO Serve Custom error page here if bucket has "
-    "<Error>" << dendl;
-  *error_content = errordoc_key;
-  // 1. Check if errordoc exists
-  // 2. Check if errordoc is public
-  // 3. Fetch errordoc content
-  /*
-   * FIXME maybe:  need to make sure all of the fields for conditional
-   * requests are cleared
-   */
-  RGWGetObj_ObjStore_S3Website* getop =
-    new RGWGetObj_ObjStore_S3Website(true);
-  getop->set_get_data(true);
+int RGWHandler_REST_S3Website::serve_errordoc(int http_ret, const string& errordoc_key) {
+  int ret = 0;
+  s->formatter->reset(); /* Try to throw it all away */
+
+  std::shared_ptr<RGWGetObj_ObjStore_S3Website> getop( (RGWGetObj_ObjStore_S3Website*) op_get() );
+  if (getop.get() == NULL) {
+    return -1; // Trigger double error handler
+  }
   getop->init(store, s, this);
+  getop->range_str = NULL;
+  getop->if_mod = NULL;
+  getop->if_unmod = NULL;
+  getop->if_match = NULL;
+  getop->if_nomatch = NULL;
+  s->object = errordoc_key;
 
-  RGWGetObj_CB cb(getop);
-  rgw_obj obj(s->bucket, errordoc_key);
-  RGWObjectCtx rctx(store);
-  //RGWRados::Object op_target(store, s->bucket_info, *static_cast<RGWObjectCtx *>(s->obj_ctx), obj);
-  RGWRados::Object op_target(store, s->bucket_info, rctx, obj);
-  RGWRados::Object::Read read_op(&op_target);
-
-  int ret;
-  int64_t ofs = 0; 
-  int64_t end = -1;
-  ret = read_op.prepare(&ofs, &end);
+  ret = init_permissions(getop.get());
   if (ret < 0) {
-    goto done;
+    ldout(s->cct, 20) << "serve_errordoc failed, init_permissions ret=" << ret << dendl;
+    return -1; // Trigger double error handler
   }
 
-  ret = read_op.iterate(ofs, end, &cb); // FIXME: need to know the final size?
-done:
-  delete getop;
-  return ret;
+  ret = read_permissions(getop.get());
+  if (ret < 0) {
+    ldout(s->cct, 20) << "serve_errordoc failed, read_permissions ret=" << ret << dendl;
+    return -1; // Trigger double error handler
+  }
+
+  if (http_ret) {
+     getop->set_custom_http_response(http_ret);
+  }
+
+  ret = getop->init_processing();
+  if (ret < 0) {
+    ldout(s->cct, 20) << "serve_errordoc failed, init_processing ret=" << ret << dendl;
+    return -1; // Trigger double error handler
+  }
+
+  ret = getop->verify_op_mask();
+  if (ret < 0) {
+    ldout(s->cct, 20) << "serve_errordoc failed, verify_op_mask ret=" << ret << dendl;
+    return -1; // Trigger double error handler
+  }
+
+  ret = getop->verify_permission();
+  if (ret < 0) {
+    ldout(s->cct, 20) << "serve_errordoc failed, verify_permission ret=" << ret << dendl;
+    return -1; // Trigger double error handler
+  }
+
+  ret = getop->verify_params();
+  if (ret < 0) {
+    ldout(s->cct, 20) << "serve_errordoc failed, verify_params ret=" << ret << dendl;
+    return -1; // Trigger double error handler
+  }
+
+  // No going back now
+  getop->pre_exec();
+  /*
+   * FIXME Missing headers:
+   * With a working errordoc, the s3 error fields are rendered as HTTP headers,
+   *   x-amz-error-code: NoSuchKey
+   *   x-amz-error-message: The specified key does not exist.
+   *   x-amz-error-detail-Key: foo
+   */
+  getop->execute();
+  getop->complete();
+  return 0;
+
 }
-  
+
 int RGWHandler_REST_S3Website::error_handler(int err_no,
 					    string* error_content) {
+  int new_err_no = -1;
   const struct rgw_http_errors* r;
   int http_error_code = -1;
-  r = search_err(err_no, RGW_HTTP_ERRORS, ARRAY_LEN(RGW_HTTP_ERRORS));
+  r = search_err(err_no > 0 ? err_no : -err_no, RGW_HTTP_ERRORS, ARRAY_LEN(RGW_HTTP_ERRORS));
   if (r) {
     http_error_code = r->http_ret;
   }
+  ldout(s->cct, 10) << "RGWHandler_REST_S3Website::error_handler err_no=" << err_no << " http_ret=" << http_error_code << dendl;
 
   RGWBWRoutingRule rrule;
   bool should_redirect =
@@ -4017,9 +4073,18 @@ int RGWHandler_REST_S3Website::error_handler(int err_no,
 		      << " proto+host:" << protocol << "://" << hostname
 		      << " -> " << s->redirect << dendl;
     return -ERR_WEBSITE_REDIRECT;
+  } else if (err_no == -ERR_WEBSITE_REDIRECT) {
+    // Do nothing here, this redirect will be handled in abort_early's ERR_WEBSITE_REDIRECT block
+    // Do NOT fire the ErrorDoc handler
   } else if (!s->bucket_info.website_conf.error_doc.empty()) {
-    RGWHandler_REST_S3Website::get_errordoc(
-      s->bucket_info.website_conf.error_doc, error_content);
+    /* This serves an entire page!
+       On success, it will return zero, and no further content should be sent to the socket
+       On failure, we need the double-error handler
+     */
+    new_err_no = RGWHandler_REST_S3Website::serve_errordoc(http_error_code, s->bucket_info.website_conf.error_doc);
+    if (new_err_no && new_err_no != -1) {
+      err_no = new_err_no;
+    }
   } else {
     ldout(s->cct, 20) << "No special error handling today!" << dendl;
   }

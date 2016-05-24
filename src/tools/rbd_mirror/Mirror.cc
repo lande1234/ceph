@@ -50,6 +50,45 @@ private:
   Mirror *mirror;
 };
 
+class StartCommand : public MirrorAdminSocketCommand {
+public:
+  explicit StartCommand(Mirror *mirror) : mirror(mirror) {}
+
+  bool call(Formatter *f, stringstream *ss) {
+    mirror->start();
+    return true;
+  }
+
+private:
+  Mirror *mirror;
+};
+
+class StopCommand : public MirrorAdminSocketCommand {
+public:
+  explicit StopCommand(Mirror *mirror) : mirror(mirror) {}
+
+  bool call(Formatter *f, stringstream *ss) {
+    mirror->stop();
+    return true;
+  }
+
+private:
+  Mirror *mirror;
+};
+
+class RestartCommand : public MirrorAdminSocketCommand {
+public:
+  explicit RestartCommand(Mirror *mirror) : mirror(mirror) {}
+
+  bool call(Formatter *f, stringstream *ss) {
+    mirror->restart();
+    return true;
+  }
+
+private:
+  Mirror *mirror;
+};
+
 class FlushCommand : public MirrorAdminSocketCommand {
 public:
   explicit FlushCommand(Mirror *mirror) : mirror(mirror) {}
@@ -77,6 +116,27 @@ public:
 				       "get status for rbd mirror");
     if (r == 0) {
       commands[command] = new StatusCommand(mirror);
+    }
+
+    command = "rbd mirror start";
+    r = admin_socket->register_command(command, command, this,
+				       "start rbd mirror");
+    if (r == 0) {
+      commands[command] = new StartCommand(mirror);
+    }
+
+    command = "rbd mirror stop";
+    r = admin_socket->register_command(command, command, this,
+				       "stop rbd mirror");
+    if (r == 0) {
+      commands[command] = new StopCommand(mirror);
+    }
+
+    command = "rbd mirror restart";
+    r = admin_socket->register_command(command, command, this,
+				       "restart rbd mirror");
+    if (r == 0) {
+      commands[command] = new RestartCommand(mirror);
     }
 
     command = "rbd mirror flush";
@@ -156,6 +216,9 @@ int Mirror::init()
   // TODO: make interval configurable
   m_local_cluster_watcher.reset(new ClusterWatcher(m_local, m_lock));
 
+  m_image_deleter.reset(new ImageDeleter(m_local, m_threads->timer,
+                                         &m_threads->timer_lock));
+
   return r;
 }
 
@@ -165,7 +228,9 @@ void Mirror::run()
   while (!m_stopping.read()) {
     m_local_cluster_watcher->refresh_pools();
     Mutex::Locker l(m_lock);
-    update_replayers(m_local_cluster_watcher->get_peer_configs());
+    if (!m_manual_stop) {
+      update_replayers(m_local_cluster_watcher->get_peer_configs());
+    }
     // TODO: make interval configurable
     m_cond.WaitInterval(g_ceph_context, m_lock, seconds(30));
   }
@@ -194,8 +259,66 @@ void Mirror::print_status(Formatter *f, stringstream *ss)
 
   if (f) {
     f->close_section();
+    f->open_object_section("image_deleter");
+  }
+
+  m_image_deleter->print_status(f, ss);
+
+  if (f) {
+    f->close_section();
     f->close_section();
     f->flush(*ss);
+  }
+}
+
+void Mirror::start()
+{
+  dout(20) << "enter" << dendl;
+  Mutex::Locker l(m_lock);
+
+  if (m_stopping.read()) {
+    return;
+  }
+
+  m_manual_stop = false;
+
+  for (auto it = m_replayers.begin(); it != m_replayers.end(); it++) {
+    auto &replayer = it->second;
+    replayer->start();
+  }
+}
+
+void Mirror::stop()
+{
+  dout(20) << "enter" << dendl;
+  Mutex::Locker l(m_lock);
+
+  if (m_stopping.read()) {
+    return;
+  }
+
+  m_manual_stop = true;
+
+  for (auto it = m_replayers.begin(); it != m_replayers.end(); it++) {
+    auto &replayer = it->second;
+    replayer->stop();
+  }
+}
+
+void Mirror::restart()
+{
+  dout(20) << "enter" << dendl;
+  Mutex::Locker l(m_lock);
+
+  if (m_stopping.read()) {
+    return;
+  }
+
+  m_manual_stop = false;
+
+  for (auto it = m_replayers.begin(); it != m_replayers.end(); it++) {
+    auto &replayer = it->second;
+    replayer->restart();
   }
 }
 
@@ -204,7 +327,7 @@ void Mirror::flush()
   dout(20) << "enter" << dendl;
   Mutex::Locker l(m_lock);
 
-  if (m_stopping.read()) {
+  if (m_stopping.read() || m_manual_stop) {
     return;
   }
 
@@ -222,8 +345,8 @@ void Mirror::update_replayers(const map<peer_t, set<int64_t> > &peer_configs)
     const peer_t &peer = kv.first;
     if (m_replayers.find(peer) == m_replayers.end()) {
       dout(20) << "starting replayer for " << peer << dendl;
-      unique_ptr<Replayer> replayer(new Replayer(m_threads, m_local, peer,
-						 m_args));
+      unique_ptr<Replayer> replayer(new Replayer(m_threads, m_image_deleter,
+                                                 m_local, peer, m_args));
       // TODO: make async, and retry connecting within replayer
       int r = replayer->init();
       if (r < 0) {

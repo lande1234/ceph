@@ -139,7 +139,7 @@ def cat_file(level, filename):
 def vstart(new, opt=""):
     print "vstarting....",
     NEW = new and "-n" or ""
-    call("MON=1 OSD=4 CEPH_PORT=7400 {path}/src/vstart.sh -l {new} -d mon osd {opt} > /dev/null 2>&1".format(new=NEW, opt=opt, path=CEPH_ROOT), shell=True)
+    call("MON=1 OSD=4 CEPH_PORT=7400 {path}/src/vstart.sh --short -l {new} -d mon osd {opt} > /dev/null 2>&1".format(new=NEW, opt=opt, path=CEPH_ROOT), shell=True)
     print "DONE"
 
 
@@ -474,6 +474,14 @@ def set_osd_weight(CFSD_PREFIX, osd_ids, osd_path, weight):
     cmd = CFSD_PREFIX + "--op set-osdmap --file {osdmap_file} --epoch {epoch} --force"
     cmd = cmd.format(osd=osd_path, osdmap_file=osdmap_file.name, epoch=epoch)
     ret = call(cmd, stdout=subprocess.DEVNULL, shell=True)
+
+    try:
+        os.unlink(osdmap_file.name)
+        os.unlink(new_crush_file.name)
+        os.unlink(old_crush_file.name)
+    except:
+        pass
+
     return ret == 0
 
 def get_osd_weights(CFSD_PREFIX, osd_ids, osd_path):
@@ -500,6 +508,13 @@ def get_osd_weights(CFSD_PREFIX, osd_ids, osd_path):
     for line in output.strip().split('\n'):
         osd_id, weight, osd_name = re.split('\s+', line)
         weights.append(float(weight))
+
+    try:
+        os.unlink(osdmap_file.name)
+        os.unlink(crush_file.name)
+    except:
+        pass
+
     return weights
 
 
@@ -569,6 +584,14 @@ def test_get_set_inc_osdmap(CFSD_PREFIX, osd_path):
         if ret:
             logging.error("Failed to revert the changed inc-osdmap")
             errors += 1
+
+    try:
+        os.unlink(file_e2.name)
+        os.unlink(file_e1_read.name)
+        os.unlink(file_e1_backup.name)
+    except:
+        pass
+
     return errors
 
 
@@ -1874,14 +1897,14 @@ def remove_btrfs_subvolumes(path):
     result = subprocess.Popen("stat -f -c '%%T' %s" % path, shell=True, stdout=subprocess.PIPE)
     filesystem = result.stdout.readlines()[0]
     if filesystem.rstrip('\n') == "btrfs":
-        result = subprocess.Popen("btrfs subvolume list %s" % path, shell=True, stdout=subprocess.PIPE)
+        result = subprocess.Popen("sudo btrfs subvolume list %s" % path, shell=True, stdout=subprocess.PIPE)
         for line in result.stdout.readlines():
             subvolume=line.split()[8]
             # extracting the relative volume name
             m = re.search(".*(%s.*)" % path, subvolume)
             if m:
                 found = m.group(1)
-                call("btrfs subvolume delete %s" % found, shell=True)
+                call("sudo btrfs subvolume delete %s" % found, shell=True)
 
 
 if __name__ == "__main__":

@@ -22,12 +22,17 @@ void rgw_get_errno_s3(struct rgw_http_errors *e, int err_no);
 
 class RGWGetObj_ObjStore_S3 : public RGWGetObj_ObjStore
 {
+protected:
+  // Serving a custom error page from an object is really a 200 response with
+  // just the status line altered.
+  int custom_http_ret = 0;
 public:
   RGWGetObj_ObjStore_S3() {}
   ~RGWGetObj_ObjStore_S3() {}
 
   int send_response_data_error();
   int send_response_data(bufferlist& bl, off_t ofs, off_t len);
+  void set_custom_http_response(int http_ret) { custom_http_ret = http_ret; }
 };
 
 class RGWListBuckets_ObjStore_S3 : public RGWListBuckets_ObjStore {
@@ -357,7 +362,7 @@ private:
   bufferlist rx_buffer;
   bufferlist tx_buffer;
   bufferlist::iterator tx_buffer_it;
-  list<string> roles_list;
+  vector<string> accepted_roles;
 
 public:
   KeystoneToken response;
@@ -373,7 +378,7 @@ private:
 public:
   explicit RGW_Auth_S3_Keystone_ValidateToken(CephContext *_cct)
       : RGWHTTPClient(_cct) {
-    get_str_list(cct->_conf->rgw_keystone_accepted_roles, roles_list);
+    get_str_vec(cct->_conf->rgw_keystone_accepted_roles, accepted_roles);
   }
 
   int receive_header(void *ptr, size_t len) {
@@ -461,17 +466,11 @@ public:
   RGWHandler_REST_S3() : RGWHandler_REST() {}
   virtual ~RGWHandler_REST_S3() {}
 
-  int get_errordoc(const string& errordoc_key, string* error_content);  
-
   virtual int init(RGWRados *store, struct req_state *s, RGWClientIO *cio);
   virtual int authorize() {
     return RGW_Auth_S3::authorize(store, s);
   }
   int postauth_init();
-  virtual int retarget(RGWOp *op, RGWOp **new_op) {
-    *new_op = op;
-    return 0;
-  }
 };
 
 class RGWHandler_REST_Service_S3 : public RGWHandler_REST_S3 {

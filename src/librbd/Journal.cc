@@ -160,8 +160,8 @@ public:
   }
 };
 
-template <typename I, typename J>
-int open_journaler(I *image_ctx, J *journaler, bool *initialized,
+template <typename J>
+int open_journaler(CephContext *cct, J *journaler, bool *initialized,
                    cls::journal::Client *client,
                    journal::ImageClientMeta *client_meta,
                    journal::TagData *tag_data) {
@@ -197,7 +197,7 @@ int open_journaler(I *image_ctx, J *journaler, bool *initialized,
   Mutex lock("lock");
   uint64_t tag_tid;
   C_DecodeTags *tags_ctx = new C_DecodeTags(
-    image_ctx->cct, &lock, &tag_tid, tag_data, &get_tags_ctx);
+      cct, &lock, &tag_tid, tag_data, &get_tags_ctx);
   journaler->get_tags(client_meta->tag_class, &tags_ctx->tags, tags_ctx);
 
   r = get_tags_ctx.wait();
@@ -480,8 +480,14 @@ int Journal<I>::reset(librados::IoCtx &io_ctx, const std::string &image_id) {
 
 template <typename I>
 int Journal<I>::is_tag_owner(I *image_ctx, bool *is_tag_owner) {
+  return Journal<>::is_tag_owner(image_ctx->md_ctx, image_ctx->id, is_tag_owner);
+}
+
+template <typename I>
+int Journal<I>::is_tag_owner(IoCtx& io_ctx, std::string& image_id,
+                             bool *is_tag_owner) {
   std::string mirror_uuid;
-  int r = get_tag_owner(image_ctx, &mirror_uuid);
+  int r = get_tag_owner(io_ctx, image_id, &mirror_uuid);
   if (r < 0) {
     return r;
   }
@@ -492,17 +498,23 @@ int Journal<I>::is_tag_owner(I *image_ctx, bool *is_tag_owner) {
 
 template <typename I>
 int Journal<I>::get_tag_owner(I *image_ctx, std::string *mirror_uuid) {
-  CephContext *cct = image_ctx->cct;
+  return get_tag_owner(image_ctx->md_ctx, image_ctx->id, mirror_uuid);
+}
+
+template <typename I>
+int Journal<I>::get_tag_owner(IoCtx& io_ctx, std::string& image_id,
+                              std::string *mirror_uuid) {
+  CephContext *cct = (CephContext *)io_ctx.cct();
   ldout(cct, 20) << __func__ << dendl;
 
-  Journaler journaler(image_ctx->md_ctx, image_ctx->id, IMAGE_CLIENT_ID,
-                      image_ctx->cct->_conf->rbd_journal_commit_age);
+  Journaler journaler(io_ctx, image_id, IMAGE_CLIENT_ID,
+                      cct->_conf->rbd_journal_commit_age);
 
   bool initialized;
   cls::journal::Client client;
   journal::ImageClientMeta client_meta;
   journal::TagData tag_data;
-  int r = open_journaler(image_ctx, &journaler, &initialized, &client,
+  int r = open_journaler(cct, &journaler, &initialized, &client,
                          &client_meta, &tag_data);
   if (r >= 0) {
     *mirror_uuid = tag_data.mirror_uuid;
@@ -526,7 +538,7 @@ int Journal<I>::request_resync(I *image_ctx) {
   cls::journal::Client client;
   journal::ImageClientMeta client_meta;
   journal::TagData tag_data;
-  int r = open_journaler(image_ctx, &journaler, &initialized, &client,
+  int r = open_journaler(image_ctx->cct, &journaler, &initialized, &client,
                          &client_meta, &tag_data);
   BOOST_SCOPE_EXIT_ALL(&journaler, &initialized) {
     if (initialized) {
@@ -567,7 +579,7 @@ int Journal<I>::promote(I *image_ctx) {
   cls::journal::Client client;
   journal::ImageClientMeta client_meta;
   journal::TagData tag_data;
-  int r = open_journaler(image_ctx, &journaler, &initialized, &client,
+  int r = open_journaler(image_ctx->cct, &journaler, &initialized, &client,
                          &client_meta, &tag_data);
   BOOST_SCOPE_EXIT_ALL(&journaler, &initialized) {
     if (initialized) {
@@ -795,6 +807,42 @@ void Journal<I>::flush_commit_position(Context *on_finish) {
 }
 
 template <typename I>
+uint64_t Journal<I>::append_write_event(AioCompletion *aio_comp,
+                                        uint64_t offset, size_t length,
+                                        const bufferlist &bl,
+                                        const AioObjectRequests &requests,
+                                        bool flush_entry) {
+  assert(m_image_ctx.owner_lock.is_locked());
+
+  assert(m_max_append_size > journal::AioWriteEvent::get_fixed_size());
+  uint64_t max_write_data_size =
+    m_max_append_size - journal::AioWriteEvent::get_fixed_size();
+
+  // ensure that the write event fits within the journal entry
+  Bufferlists bufferlists;
+  uint64_t bytes_remaining = length;
+  uint64_t event_offset = 0;
+  do {
+    uint64_t event_length = MIN(bytes_remaining, max_write_data_size);
+
+    bufferlist event_bl;
+    event_bl.substr_of(bl, event_offset, event_length);
+    journal::EventEntry event_entry(journal::AioWriteEvent(offset + event_offset,
+                                                           event_length,
+                                                           event_bl));
+
+    bufferlists.emplace_back();
+    ::encode(event_entry, bufferlists.back());
+
+    event_offset += event_length;
+    bytes_remaining -= event_length;
+  } while (bytes_remaining > 0);
+
+  return append_io_events(aio_comp, journal::EVENT_TYPE_AIO_WRITE, bufferlists,
+                          requests, offset, length, flush_entry);
+}
+
+template <typename I>
 uint64_t Journal<I>::append_io_event(AioCompletion *aio_comp,
                                      journal::EventEntry &&event_entry,
                                      const AioObjectRequests &requests,
@@ -804,8 +852,21 @@ uint64_t Journal<I>::append_io_event(AioCompletion *aio_comp,
 
   bufferlist bl;
   ::encode(event_entry, bl);
+  return append_io_events(aio_comp, event_entry.get_event_type(), {bl},
+                          requests, offset, length, flush_entry);
+}
 
-  Future future;
+template <typename I>
+uint64_t Journal<I>::append_io_events(AioCompletion *aio_comp,
+                                      journal::EventType event_type,
+                                      const Bufferlists &bufferlists,
+                                      const AioObjectRequests &requests,
+                                      uint64_t offset, size_t length,
+                                      bool flush_entry) {
+  assert(m_image_ctx.owner_lock.is_locked());
+  assert(!bufferlists.empty());
+
+  Futures futures;
   uint64_t tid;
   {
     Mutex::Locker locker(m_lock);
@@ -815,13 +876,16 @@ uint64_t Journal<I>::append_io_event(AioCompletion *aio_comp,
     tid = ++m_event_tid;
     assert(tid != 0);
 
-    future = m_journaler->append(m_tag_tid, bl);
-    m_events[tid] = Event(future, aio_comp, requests, offset, length);
+    for (auto &bl : bufferlists) {
+      assert(bl.length() <= m_max_append_size);
+      futures.push_back(m_journaler->append(m_tag_tid, bl));
+    }
+    m_events[tid] = Event(futures, aio_comp, requests, offset, length);
   }
 
   CephContext *cct = m_image_ctx.cct;
   ldout(cct, 20) << this << " " << __func__ << ": "
-                 << "event=" << event_entry.get_event_type() << ", "
+                 << "event=" << event_type << ", "
                  << "new_reqs=" << requests.size() << ", "
                  << "offset=" << offset << ", "
                  << "length=" << length << ", "
@@ -830,9 +894,9 @@ uint64_t Journal<I>::append_io_event(AioCompletion *aio_comp,
   Context *on_safe = create_async_context_callback(
     m_image_ctx, new C_IOEventSafe(this, tid));
   if (flush_entry) {
-    future.flush(on_safe);
+    futures.back().flush(on_safe);
   } else {
-    future.wait(on_safe);
+    futures.back().wait(on_safe);
   }
   return tid;
 }
@@ -1006,7 +1070,7 @@ typename Journal<I>::Future Journal<I>::wait_event(Mutex &lock, uint64_t tid,
 
   event.on_safe_contexts.push_back(create_async_context_callback(m_image_ctx,
                                                                  on_safe));
-  return event.future;
+  return event.futures.back();
 }
 
 template <typename I>
@@ -1107,7 +1171,9 @@ void Journal<I>::complete_event(typename Events::iterator it, int r) {
   event.committed_io = true;
   if (event.safe) {
     if (r >= 0) {
-      m_journaler->committed(event.future);
+      for (auto &future : event.futures) {
+        m_journaler->committed(future);
+      }
     }
     m_events.erase(it);
   }
@@ -1128,6 +1194,9 @@ void Journal<I>::handle_initialized(int r) {
     destroy_journaler(r);
     return;
   }
+
+  m_max_append_size = m_journaler->get_max_append_size();
+  ldout(cct, 20) << this << " max_append_size=" << m_max_append_size << dendl;
 
   // locate the master image client record
   cls::journal::Client client;
@@ -1201,6 +1270,10 @@ void Journal<I>::handle_replay_ready() {
     if (!m_journaler->try_pop_front(&replay_entry)) {
       return;
     }
+
+    // only one entry should be in-flight at a time
+    assert(!m_processing_entry);
+    m_processing_entry = true;
   }
 
   bufferlist data = replay_entry.get_data();
@@ -1246,6 +1319,11 @@ void Journal<I>::handle_replay_process_ready(int r) {
   ldout(cct, 20) << this << " " << __func__ << dendl;
 
   assert(r == 0);
+  {
+    Mutex::Locker locker(m_lock);
+    assert(m_processing_entry);
+    m_processing_entry = false;
+  }
   handle_replay_ready();
 }
 
@@ -1387,7 +1465,9 @@ void Journal<I>::handle_io_event_safe(int r, uint64_t tid) {
       // failed journal write so IO won't be sent -- or IO extent was
       // overwritten by future IO operations so this was a no-op IO event
       event.ret_val = r;
-      m_journaler->committed(event.future);
+      for (auto &future : event.futures) {
+        m_journaler->committed(future);
+      }
     }
 
     if (event.committed_io) {

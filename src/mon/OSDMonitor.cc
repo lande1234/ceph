@@ -26,6 +26,7 @@
 #include "PGMonitor.h"
 
 #include "MonitorDBStore.h"
+#include "Session.h"
 
 #include "crush/CrushWrapper.h"
 #include "crush/CrushTester.h"
@@ -83,7 +84,7 @@ OSDMonitor::OSDMonitor(CephContext *cct, Monitor *mn, Paxos *p, const string& se
 
 bool OSDMonitor::_have_pending_crush()
 {
-  return pending_inc.crush.length();
+  return pending_inc.crush.length() > 0;
 }
 
 CrushWrapper &OSDMonitor::_get_stable_crush()
@@ -539,14 +540,12 @@ int OSDMonitor::reweight_by_utilization(int oload,
     int num_osd = MIN(1, pgm.osd_stat.size());
     if ((uint64_t)pgm.osd_sum.kb * 1024 / num_osd
 	< g_conf->mon_reweight_min_bytes_per_osd) {
-      ostringstream oss;
       *ss << "Refusing to reweight: we only have " << pgm.osd_sum.kb
 	  << " kb across all osds!\n";
       return -EDOM;
     }
     if ((uint64_t)pgm.osd_sum.kb_used * 1024 / num_osd
 	< g_conf->mon_reweight_min_bytes_per_osd) {
-      ostringstream oss;
       *ss << "Refusing to reweight: we only have " << pgm.osd_sum.kb_used
 	  << " kb used across all osds!\n";
       return -EDOM;
@@ -599,10 +598,13 @@ int OSDMonitor::reweight_by_utilization(int oload,
     util_by_osd.push_back(osd_util);
   }
 
-  // sort and iterate from most to least utilized
-  std::sort(util_by_osd.begin(), util_by_osd.end(), [](std::pair<int, float> l, std::pair<int, float> r) {
-    return l.second > r.second;
-  });
+  // sort by absolute deviation from the mean utilization,
+  // in descending order.
+  std::sort(util_by_osd.begin(), util_by_osd.end(),
+    [average_util](std::pair<int, float> l, std::pair<int, float> r) {
+      return abs(l.second - average_util) > abs(r.second - average_util);
+    }
+  );
 
   OSDMap::Incremental newinc;
 
@@ -621,7 +623,8 @@ int OSDMonitor::reweight_by_utilization(int oload,
       // to represent e.g. differing storage capacities
       unsigned weight = osdmap.get_weight(p->first);
       unsigned new_weight = (unsigned)((average_util / util) * (float)weight);
-      new_weight = MAX(new_weight, weight - max_change);
+      if (weight > max_change)
+	new_weight = MAX(new_weight, weight - max_change);
       newinc.new_weight[p->first] = new_weight;
       if (!dry_run) {
 	pending_inc.new_weight[p->first] = new_weight;
@@ -1001,11 +1004,9 @@ void OSDMonitor::create_pending()
 
   dout(10) << "create_pending e " << pending_inc.epoch << dendl;
 
-  // drop any redundant pg_temp entries
-  OSDMap::remove_redundant_temporaries(g_ceph_context, osdmap, &pending_inc);
-
-  // drop any pg or primary_temp entries with no up entries
-  OSDMap::remove_down_temps(g_ceph_context, osdmap, &pending_inc);
+  // clean up pg_temp, primary_temp
+  OSDMap::clean_temps(g_ceph_context, osdmap, &pending_inc);
+  dout(10) << "create_pending  did clean_temps" << dendl;
 }
 
 void OSDMonitor::maybe_prime_pg_temp()
@@ -1709,6 +1710,13 @@ bool OSDMonitor::check_failures(utime_t now)
 
 bool OSDMonitor::check_failure(utime_t now, int target_osd, failure_info_t& fi)
 {
+  // already pending failure?
+  if (pending_inc.new_state.count(target_osd) &&
+      pending_inc.new_state[target_osd] & CEPH_OSD_UP) {
+    dout(10) << " already pending failure" << dendl;
+    return true;
+  }
+
   set<string> reporters_by_subtree;
   string reporter_subtree_level = g_conf->mon_osd_reporter_subtree_level;
   utime_t orig_grace(g_conf->osd_heartbeat_grace, 0);
@@ -1763,14 +1771,6 @@ bool OSDMonitor::check_failure(utime_t now, int target_osd, failure_info_t& fi)
 	   << grace << " grace (" << orig_grace << " + " << my_grace
 	   << " + " << peer_grace << "), max_failed_since " << max_failed_since
 	   << dendl;
-
-  // already pending failure?
-  if (pending_inc.new_state.count(target_osd) &&
-      pending_inc.new_state[target_osd] & CEPH_OSD_UP) {
-    dout(10) << " already pending failure" << dendl;
-    return true;
-  }
-
 
   if (failed_for >= grace &&
       (int)reporters_by_subtree.size() >= g_conf->mon_osd_min_down_reporters) {
@@ -2777,29 +2777,6 @@ void OSDMonitor::tick()
       do_propose = true;
     }
   }
-  // ---------------
-#define SWAP_PRIMARIES_AT_START 0
-#define SWAP_TIME 1
-#if 0
-  if (SWAP_PRIMARIES_AT_START) {
-    // For all PGs that have OSD 0 as the primary,
-    // switch them to use the first replca
-    ps_t numps = osdmap.get_pg_num();
-    for (int64_t pool=0; pool<1; pool++)
-      for (ps_t ps = 0; ps < numps; ++ps) {
-	pg_t pgid = pg_t(pg_t::TYPE_REPLICATED, ps, pool, -1);
-	vector<int> osds;
-	osdmap.pg_to_osds(pgid, osds);
-	if (osds[0] == 0) {
-	  pending_inc.new_pg_swap_primary[pgid] = osds[1];
-	  dout(3) << "Changing primary for PG " << pgid << " from " << osds[0] << " to "
-		  << osds[1] << dendl;
-	  do_propose = true;
-	}
-      }
-  }
-#endif
-  // ---------------
 
   if (update_pools_status())
     do_propose = true;
@@ -2840,24 +2817,6 @@ void OSDMonitor::handle_osd_timeouts(const utime_t &now,
   if (new_down) {
     propose_pending();
   }
-}
-
-void OSDMonitor::mark_all_down()
-{
-  assert(mon->is_leader());
-
-  dout(7) << "mark_all_down" << dendl;
-
-  set<int32_t> ls;
-  osdmap.get_all_osds(ls);
-  for (set<int32_t>::iterator it = ls.begin();
-       it != ls.end();
-       ++it) {
-    if (osdmap.is_down(*it)) continue;
-    pending_inc.new_state[*it] = CEPH_OSD_UP;
-  }
-
-  propose_pending();
 }
 
 void OSDMonitor::get_health(list<pair<health_status_t,string> >& summary,
@@ -4759,18 +4718,11 @@ int OSDMonitor::prepare_new_pool(string& name, uint64_t auid,
     dout(10) << " prepare_pool_size returns " << r << dendl;
     return r;
   }
-  const int64_t minsize = osdmap.crush->get_rule_mask_min_size(crush_ruleset);
-  if ((int64_t)size < minsize) {
-    *ss << "pool size " << size << " is smaller than crush ruleset name "
-        << crush_ruleset_name << " min size " << minsize;
+
+  if (!osdmap.crush->check_crush_rule(crush_ruleset, pool_type, size, *ss)) {
     return -EINVAL;
   }
-  const int64_t maxsize = osdmap.crush->get_rule_mask_max_size(crush_ruleset);
-  if ((int64_t)size > maxsize) {
-    *ss << "pool size " << size << " is bigger than crush ruleset name "
-        << crush_ruleset_name << " max size " << maxsize;
-    return -EINVAL;
-  }
+
   uint32_t stripe_width = 0;
   r = prepare_pool_stripe_width(pool_type, erasure_code_profile, &stripe_width, ss);
   if (r) {
@@ -5116,17 +5068,8 @@ int OSDMonitor::prepare_command_pool_set(map<string,cmd_vartype> &cmdmap,
       ss << "crush ruleset " << n << " does not exist";
       return -ENOENT;
     }
-    const int64_t poolsize = p.get_size();
-    const int64_t minsize = osdmap.crush->get_rule_mask_min_size(n);
-    if (poolsize < minsize) {
-      ss << "pool size " << poolsize << " is smaller than crush ruleset " 
-         << n << " min size " << minsize;
-      return -EINVAL;
-    }
-    const int64_t maxsize = osdmap.crush->get_rule_mask_max_size(n);
-    if (poolsize > maxsize) {
-      ss << "pool size " << poolsize << " is bigger than crush ruleset " 
-         << n << " max size " << maxsize;
+
+    if (!osdmap.crush->check_crush_rule(n, p.get_type(), p.get_size(), ss)) {
       return -EINVAL;
     }
     p.crush_ruleset = n;
@@ -6464,7 +6407,7 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       return true;
     }
 
-    vector<string> id_vec;
+    vector<int64_t> id_vec;
     vector<int32_t> new_pg_temp;
     if (!cmd_getval(g_ceph_context, cmdmap, "id", id_vec)) {
       ss << "unable to parse 'id' value(s) '"
@@ -6472,18 +6415,12 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       err = -EINVAL;
       goto reply;
     }
-    for (unsigned i = 0; i < id_vec.size(); i++) {
-      int32_t osd = parse_osd_id(id_vec[i].c_str(), &ss);
-      if (osd < 0) {
-        err = -EINVAL;
-        goto reply;
-      }
+    for (auto osd : id_vec) {
       if (!osdmap.exists(osd)) {
         ss << "osd." << osd << " does not exist";
         err = -ENOENT;
         goto reply;
       }
-
       new_pg_temp.push_back(osd);
     }
 
@@ -6511,27 +6448,17 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       goto reply;
     }
 
-    string id;
-    int32_t osd;
-    if (!cmd_getval(g_ceph_context, cmdmap, "id", id)) {
+    int64_t osd;
+    if (!cmd_getval(g_ceph_context, cmdmap, "id", osd)) {
       ss << "unable to parse 'id' value '"
          << cmd_vartype_stringify(cmdmap["id"]) << "'";
       err = -EINVAL;
       goto reply;
     }
-    if (strcmp(id.c_str(), "-1")) {
-      osd = parse_osd_id(id.c_str(), &ss);
-      if (osd < 0) {
-        err = -EINVAL;
-        goto reply;
-      }
-      if (!osdmap.exists(osd)) {
-        ss << "osd." << osd << " does not exist";
-        err = -ENOENT;
-        goto reply;
-      }
-    } else {
-      osd = -1;
+    if (osd != -1 && !osdmap.exists(osd)) {
+      ss << "osd." << osd << " does not exist";
+      err = -ENOENT;
+      goto reply;
     }
 
     if (!g_conf->mon_osd_allow_primary_temp) {
@@ -7644,6 +7571,11 @@ done:
     }
     int64_t max_osds = g_conf->mon_reweight_max_osds;
     cmd_getval(g_ceph_context, cmdmap, "max_osds", max_osds);
+    if (max_osds <= 0) {
+      ss << "max_osds " << max_osds << " must be positive";
+      err = -EINVAL;
+      goto reply;
+    }
     string no_increasing;
     cmd_getval(g_ceph_context, cmdmap, "no_increasing", no_increasing);
     string out_str;
@@ -8021,6 +7953,16 @@ bool OSDMonitor::_check_become_tier(
     *ss << "pool '" << base_pool_name << "' is already a tier of '"
       << osdmap.get_pool_name(base_pool->tier_of) << "', "
       << "multiple tiers are not yet supported.";
+    *err = -EINVAL;
+    return false;
+  }
+
+  if (tier_pool->has_tiers()) {
+    *ss << "pool '" << tier_pool_name << "' has following tier(s) already:";
+    for (set<uint64_t>::iterator it = tier_pool->tiers.begin();
+         it != tier_pool->tiers.end(); it++)
+      *ss << "'" << osdmap.get_pool_name(*it) << "',";
+    *ss << " multiple tiers are not yet supported.";
     *err = -EINVAL;
     return false;
   }
