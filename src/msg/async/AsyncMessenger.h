@@ -68,7 +68,7 @@ class Worker : public Thread {
   EventCenter center;
   Worker(CephContext *c, WorkerPool *p, int i)
     : cct(c), pool(p), done(false), id(i), perf_logger(NULL), center(c) {
-    center.init(InitEventNumber);
+    center.init(InitEventNumber, i);
     char name[128];
     sprintf(name, "AsyncMessenger::Worker-%d", id);
     // initialize perf_logger
